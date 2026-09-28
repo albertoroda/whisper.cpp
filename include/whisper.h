@@ -339,6 +339,40 @@ extern "C" {
                                int   n_past,
                                int   n_threads);
 
+    // LiveStems: forced alignment of known text against the window last encoded in `state`
+    // (whisper_pcm_to_mel_with_state + whisper_encode_with_state first). The context must be created with
+    // dtw_token_timestamps = true and an alignment heads preset. Writes, per alignment head, the cross-attention of
+    // [no_timestamps, text...] softmaxed over the first n_audio_tokens frames (20 ms each) into out_attn
+    // (n_heads x (n_text + 1) x n_audio_tokens, size it with whisper_forced_align_max_heads), and the probability
+    // of each text token into out_probs (n_text). Returns the number of heads, or -1 on error.
+    // LiveStems: exact Whisper BPE tokenization (tiktoken), valid for any script. Same return convention as
+    // whisper_tokenize: number of tokens, or minus the number needed if n_max_tokens is too small.
+    WHISPER_API int whisper_tokenize_bpe(struct whisper_context * ctx, const char * text, whisper_token * tokens, int n_max_tokens);
+    // LiveStems: greedy transcription of a clip into text tokens (< eot) with their DTW start times in centiseconds
+    // relative to the clip start. Returns the number of tokens, or -1 on error / if n_max is too small.
+    WHISPER_API int whisper_transcribe_tokens_with_state(
+            struct whisper_context * ctx,
+              struct whisper_state * state,
+                       const float * samples,
+                               int   n_samples,
+                               int   lang_id,
+                               int   n_threads,
+                     whisper_token * out_tokens,
+                             int   * out_t_cs,
+                               int   n_max);
+    WHISPER_API struct whisper_context * whisper_init_for_alignment(const char * path_model, int aheads_preset);
+    WHISPER_API int whisper_forced_align_max_heads(struct whisper_context * ctx);
+    WHISPER_API int whisper_forced_align_with_state(
+            struct whisper_context * ctx,
+              struct whisper_state * state,
+                               int   lang_id,
+               const whisper_token * text,
+                               int   n_text,
+                               int   n_audio_tokens,
+                               int   n_threads,
+                             float * out_attn,
+                             float * out_probs);
+
     // Convert the provided text into tokens.
     // The tokens pointer must be large enough to hold the resulting tokens.
     // Returns the number of tokens on success, no more than n_max_tokens

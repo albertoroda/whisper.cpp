@@ -9357,3 +9357,330 @@ static void whisper_log_callback_default(ggml_log_level level, const char * text
     fputs(text, stderr);
     fflush(stderr);
 }
+
+//
+// LiveStems: forced alignment of known text (lyrics) against an encoded window.
+//
+// Mirrors openai-whisper timing.find_alignment / stable-ts _compute_atten_weights up to (not including) the
+// normalization: decoder input is [sot, lang, transcribe, no_timestamps, text..., eot]; for every alignment head the
+// cross-attention of rows [no_timestamps, text...] (sot sequence and eot dropped) is softmaxed over the first
+// n_audio_tokens frames only. whisper.cpp softmaxes over the full audio context (padding included), so each row is
+// renormalized over the real frames, which is exactly softmax of the truncated row.
+//
+
+int whisper_forced_align_max_heads(struct whisper_context * ctx) {
+    return ctx->model.hparams.n_text_layer * ctx->model.hparams.n_text_head;
+}
+
+int whisper_forced_align_with_state(
+        struct whisper_context * ctx,
+          struct whisper_state * state,
+                           int   lang_id,
+           const whisper_token * text,
+                           int   n_text,
+                           int   n_audio_tokens,
+                           int   n_threads,
+                         float * out_attn,
+                         float * out_probs) {
+    if (!ctx->params.dtw_token_timestamps) {
+        WHISPER_LOG_ERROR("%s: context must be created with dtw_token_timestamps = true\n", __func__);
+        return -1;
+    }
+    const int n_audio_ctx = state->exp_n_audio_ctx > 0 ? state->exp_n_audio_ctx : ctx->model.hparams.n_audio_ctx;
+    if (n_audio_tokens <= 0 || n_audio_tokens > n_audio_ctx) {
+        WHISPER_LOG_ERROR("%s: n_audio_tokens %d out of range\n", __func__, n_audio_tokens);
+        return -1;
+    }
+
+    std::vector<whisper_token> tokens = { whisper_token_sot(ctx) };
+    if (whisper_is_multilingual(ctx)) {
+        tokens.push_back(whisper_token_lang(ctx, lang_id));
+        tokens.push_back(whisper_token_transcribe(ctx));
+    }
+    const int sot_len = (int) tokens.size();
+    tokens.push_back(whisper_token_not(ctx));
+    tokens.insert(tokens.end(), text, text + n_text);
+    tokens.push_back(whisper_token_eot(ctx));
+    const int n_tokens = (int) tokens.size();
+    if (n_tokens > ctx->model.hparams.n_text_ctx) {
+        WHISPER_LOG_ERROR("%s: too many tokens (%d)\n", __func__, n_tokens);
+        return -1;
+    }
+
+    whisper_kv_cache_clear(state->kv_self);
+    whisper_batch_prep_legacy(state->batch, tokens.data(), n_tokens, 0, 0);
+    for (int i = 0; i < n_tokens; ++i) {
+        state->batch.logits[i] = 1;
+    }
+    whisper_kv_cache_seq_rm(state->kv_self, 0, 0, -1);
+    if (!whisper_decode_internal(*ctx, *state, state->batch, n_threads, true, nullptr, nullptr)) {
+        WHISPER_LOG_ERROR("%s: decoder failed\n", __func__);
+        return -1;
+    }
+    ggml_tensor * qks = state->aheads_cross_QKs;
+    if (qks == nullptr || qks->type != GGML_TYPE_F32 || qks->ne[0] != n_tokens) {
+        WHISPER_LOG_ERROR("%s: missing alignment heads attention\n", __func__);
+        return -1;
+    }
+    const int n_heads = (int) qks->ne[2];
+    auto & data = state->aheads_cross_QKs_data;
+    data.resize((size_t) n_tokens * n_audio_ctx * n_heads);
+    ggml_backend_tensor_get(qks, data.data(), 0, sizeof(float) * data.size());
+
+    // data[t + j*n_tokens + k*n_tokens*n_audio_ctx] = head k, audio frame j, token t
+    const int n_rows = n_text + 1; // no_timestamps + text
+    for (int k = 0; k < n_heads; ++k) {
+        for (int r = 0; r < n_rows; ++r) {
+            const int t = sot_len + r;
+            double sum = 0.0;
+            for (int j = 0; j < n_audio_tokens; ++j) {
+                sum += data[t + (size_t) j * n_tokens + (size_t) k * n_tokens * n_audio_ctx];
+            }
+            const float inv = sum > 0.0 ? (float) (1.0 / sum) : 0.0f;
+            float * dst = out_attn + ((size_t) k * n_rows + r) * n_audio_tokens;
+            for (int j = 0; j < n_audio_tokens; ++j) {
+                dst[j] = data[t + (size_t) j * n_tokens + (size_t) k * n_tokens * n_audio_ctx] * inv;
+            }
+        }
+    }
+
+    // Probability of each text token given its prefix, softmax restricted to the text vocabulary (< eot).
+    const int n_vocab = ctx->vocab.n_vocab;
+    const int eot = whisper_token_eot(ctx);
+    for (int i = 0; i < n_text; ++i) {
+        const float * logits = state->logits.data() + (size_t) (sot_len + i) * n_vocab;
+        float max_l = -INFINITY;
+        for (int v = 0; v < eot; ++v) max_l = std::max(max_l, logits[v]);
+        double denom = 0.0;
+        for (int v = 0; v < eot; ++v) denom += std::exp((double) logits[v] - max_l);
+        out_probs[i] = text[i] < eot ? (float) (std::exp((double) logits[text[i]] - max_l) / denom) : 0.0f;
+    }
+    return n_heads;
+}
+
+struct whisper_context * whisper_init_for_alignment(const char * path_model, int aheads_preset) {
+    struct whisper_context_params params = whisper_context_default_params();
+    params.use_gpu              = false;
+    params.flash_attn           = false; // the alignment heads need the explicit cross-attention softmax
+    params.dtw_token_timestamps = true;
+    params.dtw_aheads_preset    = (enum whisper_alignment_heads_preset) aheads_preset;
+    return whisper_init_from_file_with_params(path_model, params);
+}
+
+//
+// LiveStems: exact Whisper (tiktoken "multilingual"/"gpt2") tokenization, for any script.
+//
+// whisper.cpp's tokenize() splits with std::regex [[:alpha:]] (ASCII-only in the C locale: "ñ", "é", "ж", "日" are
+// not letters) and then picks the longest vocab match, which is not BPE. Forced alignment needs the exact tokens the
+// model was trained on, so this reimplements tiktoken: the GPT-2 pre-tokenization pattern
+//     's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+// over Unicode code points, then byte-level BPE where a merge's priority is the merged token's id (in Whisper's
+// vocab the id is the tiktoken rank; checked for every text token).
+//
+
+#include "livestems_unicode_ranges.h"
+
+static bool livestems_cp_in(const livestems_cp_range * r, size_t n, uint32_t cp) {
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        const size_t mid = (lo + hi) / 2;
+        if (cp < r[mid].first) {
+            hi = mid;
+        } else if (cp > r[mid].last) {
+            lo = mid + 1;
+        } else {
+            return true;
+        }
+    }
+    return false;
+}
+
+enum livestems_cp_class { LS_LETTER, LS_NUMBER, LS_SPACE, LS_OTHER };
+
+struct livestems_cp {
+    uint32_t cp;
+    size_t   off;
+    livestems_cp_class cls;
+};
+
+static livestems_cp_class livestems_classify(uint32_t cp) {
+    if (livestems_cp_in(livestems_cp_letter, livestems_cp_letter_count, cp)) return LS_LETTER;
+    if (livestems_cp_in(livestems_cp_number, livestems_cp_number_count, cp)) return LS_NUMBER;
+    if (livestems_cp_in(livestems_cp_space,  livestems_cp_space_count,  cp)) return LS_SPACE;
+    return LS_OTHER;
+}
+
+// UTF-8 -> code points with byte offsets. An invalid byte becomes one U+FFFD code point (class "other") that
+// still maps back to that original byte.
+static std::vector<livestems_cp> livestems_decode_utf8(const std::string & s) {
+    std::vector<livestems_cp> out;
+    size_t i = 0;
+    const size_t n = s.size();
+    while (i < n) {
+        const unsigned char c = (unsigned char) s[i];
+        uint32_t cp = 0xFFFD;
+        size_t len = 1;
+        if (c < 0x80) {
+            cp = c;
+        } else if ((c >> 5) == 0x6 && i + 1 < n && ((unsigned char) s[i + 1] >> 6) == 0x2) {
+            cp = ((c & 0x1F) << 6) | ((unsigned char) s[i + 1] & 0x3F);
+            len = cp >= 0x80 ? 2 : 1;
+            if (len == 1) cp = 0xFFFD;
+        } else if ((c >> 4) == 0xE && i + 2 < n && ((unsigned char) s[i + 1] >> 6) == 0x2 && ((unsigned char) s[i + 2] >> 6) == 0x2) {
+            cp = ((c & 0x0F) << 12) | (((unsigned char) s[i + 1] & 0x3F) << 6) | ((unsigned char) s[i + 2] & 0x3F);
+            len = (cp >= 0x800 && (cp < 0xD800 || cp > 0xDFFF)) ? 3 : 1;
+            if (len == 1) cp = 0xFFFD;
+        } else if ((c >> 3) == 0x1E && i + 3 < n && ((unsigned char) s[i + 1] >> 6) == 0x2 && ((unsigned char) s[i + 2] >> 6) == 0x2 && ((unsigned char) s[i + 3] >> 6) == 0x2) {
+            cp = ((c & 0x07) << 18) | (((unsigned char) s[i + 1] & 0x3F) << 12) | (((unsigned char) s[i + 2] & 0x3F) << 6) | ((unsigned char) s[i + 3] & 0x3F);
+            len = (cp >= 0x10000 && cp <= 0x10FFFF) ? 4 : 1;
+            if (len == 1) cp = 0xFFFD;
+        }
+        out.push_back({ cp, i, len == 1 && c >= 0x80 ? LS_OTHER : livestems_classify(cp) });
+        i += len;
+    }
+    return out;
+}
+
+static std::vector<std::string> livestems_pretokenize(const std::string & text) {
+    const std::vector<livestems_cp> cps = livestems_decode_utf8(text);
+    const size_t n = cps.size();
+    std::vector<std::string> pieces;
+    auto push = [&](size_t a, size_t b) {
+        const size_t end = b < n ? cps[b].off : text.size();
+        pieces.push_back(text.substr(cps[a].off, end - cps[a].off));
+    };
+    size_t i = 0;
+    while (i < n) {
+        // 's|'t|'re|'ve|'m|'ll|'d
+        if (cps[i].cp == '\'' && i + 1 < n) {
+            const uint32_t c1 = cps[i + 1].cp;
+            if (c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd') {
+                push(i, i + 2); i += 2; continue;
+            }
+            if (i + 2 < n) {
+                const uint32_t c2 = cps[i + 2].cp;
+                if ((c1 == 'r' && c2 == 'e') || (c1 == 'v' && c2 == 'e') || (c1 == 'l' && c2 == 'l')) {
+                    push(i, i + 3); i += 3; continue;
+                }
+            }
+        }
+        // ' ?\p{L}+' | ' ?\p{N}+' | ' ?[^\s\p{L}\p{N}]+'
+        {
+            const size_t start = (cps[i].cp == ' ' && i + 1 < n) ? i + 1 : i;
+            const livestems_cp_class cls = cps[start].cls;
+            if (cls != LS_SPACE && (start == i + 1 || cps[i].cp != ' ')) {
+                size_t j = start;
+                while (j < n && cps[j].cls == cls) j++;
+                push(i, j); i = j; continue;
+            }
+        }
+        // '\s+(?!\S)' | '\s+'
+        size_t j = i;
+        while (j < n && cps[j].cls == LS_SPACE) j++;
+        if (j == i) {
+            // unreachable: every code point is a letter, number, space or other
+            push(i, i + 1); i++; continue;
+        }
+        if (j < n && j - i > 1) {
+            push(i, j - 1); i = j - 1; // leave the last space to prefix the next word
+        } else {
+            push(i, j); i = j;
+        }
+    }
+    return pieces;
+}
+
+static void livestems_bpe(const whisper_vocab & vocab, whisper_token eot, const std::string & piece,
+                          std::vector<whisper_token> & out) {
+    auto rank = [&](const std::string & s) -> int {
+        const auto it = vocab.token_to_id.find(s);
+        return (it != vocab.token_to_id.end() && it->second < eot) ? it->second : INT_MAX;
+    };
+    const int whole = rank(piece);
+    if (whole != INT_MAX) {
+        out.push_back(whole);
+        return;
+    }
+    std::vector<std::string> parts;
+    parts.reserve(piece.size());
+    for (char c : piece) parts.emplace_back(1, c);
+    while (parts.size() > 1) {
+        int best = INT_MAX;
+        size_t best_i = 0;
+        for (size_t k = 0; k + 1 < parts.size(); ++k) {
+            const int r = rank(parts[k] + parts[k + 1]);
+            if (r < best) {
+                best = r;
+                best_i = k;
+            }
+        }
+        if (best == INT_MAX) break;
+        parts[best_i] += parts[best_i + 1];
+        parts.erase(parts.begin() + best_i + 1);
+    }
+    for (const auto & p : parts) {
+        out.push_back(rank(p)); // every single byte is a token
+    }
+}
+
+int whisper_tokenize_bpe(struct whisper_context * ctx, const char * text, whisper_token * tokens, int n_max_tokens) {
+    std::vector<whisper_token> res;
+    const whisper_token eot = whisper_token_eot(ctx);
+    for (const auto & piece : livestems_pretokenize(text)) {
+        livestems_bpe(ctx->vocab, eot, piece, res);
+    }
+    if (n_max_tokens < (int) res.size()) {
+        return -(int) res.size();
+    }
+    for (size_t i = 0; i < res.size(); i++) {
+        tokens[i] = res[i];
+    }
+    return (int) res.size();
+}
+
+//
+// LiveStems: quick transcription of a clip into text tokens with their DTW start times, used as anchors to decide in
+// which section each lyrics line is sung. Greedy, no temperature fallback, no conditioning on previous text: the
+// anchors only need recognizable words, and this keeps the cost close to a single decode pass.
+//
+int whisper_transcribe_tokens_with_state(
+        struct whisper_context * ctx,
+          struct whisper_state * state,
+                   const float * samples,
+                           int   n_samples,
+                           int   lang_id,
+                           int   n_threads,
+                 whisper_token * out_tokens,
+                         int   * out_t_cs,
+                           int   n_max) {
+    struct whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+    params.n_threads        = n_threads;
+    params.language         = whisper_lang_str(lang_id);
+    params.detect_language  = false;
+    params.no_context       = true;
+    params.temperature      = 0.0f;
+    params.temperature_inc  = 0.0f;
+    params.print_special    = false;
+    params.print_progress   = false;
+    params.print_realtime   = false;
+    params.print_timestamps = false;
+    params.token_timestamps = false; // DTW times come from the context (dtw_token_timestamps)
+    if (whisper_full_with_state(ctx, state, params, samples, n_samples) != 0) {
+        return -1;
+    }
+    const whisper_token eot = whisper_token_eot(ctx);
+    int n = 0;
+    const int n_segments = whisper_full_n_segments_from_state(state);
+    for (int s = 0; s < n_segments; ++s) {
+        const int n_tok = whisper_full_n_tokens_from_state(state, s);
+        for (int t = 0; t < n_tok; ++t) {
+            const whisper_token_data data = whisper_full_get_token_data_from_state(state, s, t);
+            if (data.id >= eot) continue;
+            if (n >= n_max) return -1;
+            out_tokens[n] = data.id;
+            out_t_cs[n]   = (int) data.t_dtw;
+            ++n;
+        }
+    }
+    return n;
+}
